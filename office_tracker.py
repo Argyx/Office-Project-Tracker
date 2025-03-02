@@ -18,6 +18,7 @@ from nltk.corpus import stopwords
 import langdetect  # For language detection
 from collections import Counter
 import hashlib
+from tqdm import tqdm
 
 # Load environment variables from .env file
 load_dotenv()
@@ -49,6 +50,34 @@ COMPANY_IDENTIFIERS = {
         "Επενδύσεις", "Επενδυσεις", "Κατασκευαστική", "Κατασκευαστικη"
     ]
 }
+
+# Keywords related to office projects (both English and Greek)
+OFFICE_KEYWORDS = [
+    # English keywords
+    'office', 'headquarters', 'hq', 'building', 'real estate', 'property', 
+    'workspace', 'commercial', 'lease', 'square meters', 'sqm', 'm²',
+    'development', 'project', 'acquisition', 'purchase', 'move', 'relocation',
+    # Greek keywords
+    'γραφεία', 'γραφείο', 'έδρα', 'κτίριο', 'ακίνητο', 'ακίνητα', 
+    'επαγγελματικό', 'επαγγελματική στέγη', 'εμπορικό', 'μίσθωση',
+    'τετραγωνικά μέτρα', 'τ.μ.', 'τ.μ', 'τμ', 'μ²',
+    'ανάπτυξη', 'έργο', 'εξαγορά', 'αγορά', 'μετακόμιση', 'μετεγκατάσταση'
+]
+
+def detect_language(text):
+    """Simple language detection function.
+    Returns 'el' for Greek, 'en' for English, 'unknown' otherwise."""
+    if not text or not isinstance(text, str):
+        return "unknown"
+        
+    # Simple check for Greek characters
+    greek_chars = set('αβγδεζηθικλμνξοπρστυφχψωάέήίόύώϊϋΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩΆΈΉΊΌΎΏΪΫ')
+    sample = text[:100].lower()  # Take a sample
+    greek_count = sum(1 for c in sample if c in greek_chars)
+    
+    if greek_count > len(sample) * 0.3:  # If more than 30% Greek characters
+        return "el"
+    return "en"
 
 # Step 1: Create and setup the database
 def create_database():
@@ -129,6 +158,8 @@ def create_database():
 
 
 # Step 2: Search the web using multiple search strategies
+
+# Then modify the search_web function to include progress bars
 def search_web(api_key, cse_id):
     all_results = []
     searches_performed = 0
@@ -191,15 +222,20 @@ def search_web(api_key, cse_id):
     cursor = conn.cursor()
     cutoff_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     
-    cursor.execute('''
-        SELECT query FROM search_log 
-        WHERE date_searched > ? AND results_count > 0
-        GROUP BY query 
-        ORDER BY SUM(results_count) DESC 
-        LIMIT 5
-    ''', (cutoff_date,))
+    try:
+        cursor.execute('''
+            SELECT query FROM search_log 
+            WHERE date_searched > ? AND results_count > 0
+            GROUP BY query 
+            ORDER BY SUM(results_count) DESC 
+            LIMIT 5
+        ''', (cutoff_date,))
+        
+        successful_queries = [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        logging.warning(f"Could not retrieve successful queries: {e}")
+        successful_queries = []
     
-    successful_queries = [row[0] for row in cursor.fetchall()]
     conn.close()
     
     # Add successful queries from past (with priority)
@@ -209,11 +245,19 @@ def search_web(api_key, cse_id):
     max_queries = int(os.environ.get("MAX_SEARCH_QUERIES", "30"))
     search_queries = search_queries[:max_queries]
     
-    # Search with each query
-    for query in search_queries:
+    print(f"Searching with {len(search_queries)} queries...")
+    
+    # Search with each query - now with progress bar
+    for query in tqdm(search_queries, desc="Searching", unit="query"):
         try:
-            # Detect query language
-            query_lang = detect_language(query)
+            # Detect query language - Simple implementation that won't fail
+            query_lang = "en"  # Default to English
+            try:
+                if query and isinstance(query, str):
+                    if any(c in 'αβγδεζηθικλμνξοπρστυφχψωάέήίόύώϊϋΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩΆΈΉΊΌΎΏΪΫ' for c in query):
+                        query_lang = "el"
+            except Exception:
+                pass  # Silently fail and use default language
             
             url = f"https://www.googleapis.com/customsearch/v1?q={query}&cx={cse_id}&key={api_key}&dateRestrict=d7"
             response = requests.get(url, timeout=30)
@@ -252,24 +296,77 @@ def search_web(api_key, cse_id):
                     
                     # Fetch full content if possible
                     try:
-                        page_resp = requests.get(result['link'], timeout=20)
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.5',
+                            'Connection': 'keep-alive',
+                        }
+                        
+                        # First try with normal verification
+                        try:
+                            page_resp = requests.get(
+                                result['link'], 
+                                timeout=15,  # Slightly shorter timeout to avoid long waits
+                                headers=headers
+                            )
+                        except requests.exceptions.SSLError:
+                            # If SSL fails, try with verification disabled but log a warning
+                            logging.warning(f"SSL verification failed for {result['link']}, trying without verification")
+                            page_resp = requests.get(
+                                result['link'], 
+                                timeout=15,
+                                headers=headers,
+                                verify=False  # Disable SSL verification as fallback
+                            )
+                        
                         if page_resp.status_code == 200:
+                            # Try to determine the encoding
+                            if 'charset' in page_resp.headers.get('content-type', '').lower():
+                                page_resp.encoding = page_resp.apparent_encoding
+                                
                             soup = BeautifulSoup(page_resp.text, 'html.parser')
-                            # Get the main content if possible
-                            main_content = soup.find('main') or soup.find('article') or soup.body
+                            
+                            # Try multiple content extraction methods
+                            main_content = None
+                            
+                            # Method 1: Look for common content containers
+                            for container in ['main', 'article', 'div.content', 'div.main-content', '#content', '.post-content']:
+                                if main_content:
+                                    break
+                                try:
+                                    main_content = soup.select_one(container)
+                                except:
+                                    pass
+                            
+                            # Method 2: If no container found, use body
+                            if not main_content:
+                                main_content = soup.body
+                                
+                            # Extract the text content
                             if main_content:
-                                result['full_content'] = main_content.get_text(strip=True)[:10000]  # Limit content length
+                                # Remove script and style elements that might contain code
+                                for script in main_content(["script", "style", "nav", "footer", "header"]):
+                                    script.extract()
+                                    
+                                result['full_content'] = ' '.join(main_content.get_text(separator=' ', strip=True).split())[:10000]
                             else:
-                                result['full_content'] = soup.get_text(strip=True)[:5000]  # Limit content length
+                                result['full_content'] = ' '.join(soup.get_text(separator=' ', strip=True).split())[:5000]
                             
                             # Extract publication date if available
                             pub_date = None
-                            date_meta = soup.find('meta', {'property': 'article:published_time'}) or \
-                                      soup.find('meta', {'name': 'pubdate'}) or \
-                                      soup.find('meta', {'name': 'date'})
-                            
-                            if date_meta and 'content' in date_meta.attrs:
-                                pub_date = date_meta['content'][:10]  # Get YYYY-MM-DD portion
+                            # Try multiple date meta tags
+                            for meta_name in ['article:published_time', 'pubdate', 'date', 'publication_date', 'publish-date']:
+                                date_meta = soup.find('meta', {'property': meta_name}) or soup.find('meta', {'name': meta_name})
+                                if date_meta and 'content' in date_meta.attrs:
+                                    pub_date = date_meta['content'][:10]  # Get YYYY-MM-DD portion
+                                    break
+                                    
+                            # Alternative: Look for dates in time tags
+                            if not pub_date:
+                                time_tag = soup.find('time')
+                                if time_tag and time_tag.has_attr('datetime'):
+                                    pub_date = time_tag['datetime'][:10]
                             
                             if pub_date:
                                 result['publication_date'] = pub_date
@@ -299,16 +396,19 @@ def search_web(api_key, cse_id):
         'results_per_query': len(all_results) / max(searches_performed, 1)
     })
     
-    cursor.execute('''
-        INSERT INTO analytics (date, searches_performed, results_found, performance_metrics)
-        VALUES (?, ?, ?, ?)
-    ''', (datetime.now().strftime("%Y-%m-%d"), searches_performed, len(all_results), performance_metrics))
+    try:
+        cursor.execute('''
+            INSERT INTO analytics (date, searches_performed, results_found, performance_metrics)
+            VALUES (?, ?, ?, ?)
+        ''', (datetime.now().strftime("%Y-%m-%d"), searches_performed, len(all_results), performance_metrics))
+        
+        conn.commit()
+    except Exception as e:
+        logging.warning(f"Could not record search metrics: {e}")
     
-    conn.commit()
     conn.close()
     
     return all_results
-
 # Extract company names from text
 def extract_company_names(text, language="en"):
     """
@@ -481,105 +581,188 @@ def extract_project_type(content, language="en"):
             return "Acquisition"
     
     return "Office Project"  # Default
+
+# Step 3: Evaluate relevance and extract entities
+# Update the evaluate_relevance function to fix the NLTK resource loading issue
+def evaluate_relevance(results):
+    relevant_results = []
     
-    # Try to download NLTK resources if not already available
+    # Try to download NLTK resources - ensure we get the right packages
+    print("Downloading required NLTK resources...")
     try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt')
+        nltk.download('punkt', quiet=True)
+        nltk.download('stopwords', quiet=True)
+    except Exception as e:
+        print(f"Warning: Could not download NLTK resources: {e}")
+        print("Continuing with basic functionality...")
+        logging.warning(f"Could not download NLTK resources: {e}")
     
-    try:
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('stopwords')
+    # Create a simple tokenizer function that doesn't rely on punkt_tab
+    def simple_tokenize(text):
+        """Simple tokenizer that doesn't rely on NLTK resources."""
+        # Replace punctuation with spaces
+        for char in '.,;:!?()[]{}"\'':
+            text = text.replace(char, ' ')
+        # Split by whitespace and filter out empty tokens
+        return [token for token in text.split() if token]
     
-    # Get both English and Greek stopwords if available
-    stop_words = set(stopwords.words('english'))
+    # Get English stopwords if available, otherwise use a minimal set
     try:
-        # Add Greek stopwords if available
-        greek_stop_words = set(stopwords.words('greek'))
-        stop_words = stop_words.union(greek_stop_words)
+        stop_words = set(stopwords.words('english'))
     except:
-        # If Greek not available, define basic Greek stopwords
-        greek_stop_words = {
-            'ο', 'η', 'το', 'οι', 'τα', 'του', 'της', 'των', 'τον', 'την', 'και',
-            'κι', 'κ', 'με', 'σε', 'από', 'για', 'προς', 'παρά', 'αντί', 'μέχρι',
-            'ως', 'πως', 'ότι', 'είναι', 'ήταν', 'θα', 'να', 'δεν', 'μη', 'μην'
-        }
-        stop_words = stop_words.union(greek_stop_words)
+        # Minimal English stopwords
+        stop_words = {'a', 'an', 'the', 'and', 'or', 'but', 'if', 'then', 'else', 'when',
+                     'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into',
+                     'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from',
+                     'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'of', 'is', 'are'}
     
-    for result in results:
-        # Initial score based on the presence of company names
+    # Add minimal Greek stopwords
+    greek_stop_words = {
+        'ο', 'η', 'το', 'οι', 'τα', 'του', 'της', 'των', 'τον', 'την', 'και',
+        'κι', 'κ', 'με', 'σε', 'από', 'για', 'προς', 'παρά', 'αντί', 'μέχρι',
+        'ως', 'πως', 'ότι', 'είναι', 'ήταν', 'θα', 'να', 'δεν', 'μη', 'μην'
+    }
+    stop_words = stop_words.union(greek_stop_words)
+    
+    # Track overall statistics for discovered companies
+    conn = sqlite3.connect("office_projects.db")
+    cursor = conn.cursor()
+    
+    print(f"Analyzing relevance of {len(results)} search results...")
+    
+    # Process results with progress bar
+    for result in tqdm(results, desc="Analyzing content", unit="result"):
+        # Initial score based on content relevance
         score = 0
-        company_found = None
         
-        # Identify company mentions
-        for company in COMPANIES_TO_TRACK:
-            company_lower = company.lower()
-            if company_lower in result['title'].lower() or company_lower in result['snippet'].lower() or company_lower in result.get('full_content', '').lower():
-                score += 15
-                company_found = company
-                break
+        # Language detection
+        content_to_check = f"{result['title']} {result['snippet']} {result.get('full_content', '')}"
+        
+        # Detect language of the content
+        try:
+            content_lang = detect_language(content_to_check[:1000])  # Sample for efficiency
+        except:
+            content_lang = "en"  # Default to English if detection fails
+        
+        # Extract potential companies
+        extracted_companies = extract_company_names(content_to_check, content_lang)
+        
+        # Extract locations
+        extracted_locations = extract_locations(content_to_check, content_lang)
+        
+        # Extract project type
+        project_type = extract_project_type(content_to_check, content_lang)
+        
+        # If no companies found but appears to be about offices, try harder
+        if not extracted_companies:
+            # Look for company-like patterns
+            if content_lang == "en":
+                company_pattern = r'([A-Z][a-zA-Z\'\-\&\s]{2,30})'
+            else:  # Greek
+                company_pattern = r'([Α-ΩΆΈΉΊΌΎΏΪΫ][α-ωάέήίόύώϊϋΑ-ΩΆΈΉΊΌΎΏΪΫ\'\-\&\s]{2,30})'
+            
+            # Check for potential company names in title
+            potential_companies = re.findall(company_pattern, result['title'])
+            for company in potential_companies:
+                if 3 < len(company) < 40 and company not in extracted_companies:
+                    extracted_companies.append(company)
+        
+        # If we found at least one company, add points
+        if extracted_companies:
+            score += 25
+            result['extracted_companies'] = extracted_companies
+            
+            # Store or update companies in the database
+            for company in extracted_companies:
+                try:
+                    cursor.execute('''
+                        INSERT INTO companies (name, last_seen_date) 
+                        VALUES (?, ?) 
+                        ON CONFLICT(name) 
+                        DO UPDATE SET mention_count = mention_count + 1, 
+                                      last_seen_date = ?
+                    ''', (company, datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d")))
+                except Exception as e:
+                    logging.warning(f"Error updating company database: {e}")
+        
+        # If we found locations, add points
+        if extracted_locations:
+            score += 15
+            result['extracted_locations'] = extracted_locations
+            
+            # Store location information
+            for location in extracted_locations:
+                try:
+                    cursor.execute('''
+                        INSERT INTO locations (name, last_seen_date) 
+                        VALUES (?, ?) 
+                        ON CONFLICT(name) 
+                        DO UPDATE SET mention_count = mention_count + 1, 
+                                      last_seen_date = ?
+                    ''', (location, datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d")))
+                except Exception as e:
+                    logging.warning(f"Error updating location database: {e}")
+        else:
+            # If no specific location found, default to a generic one
+            result['extracted_locations'] = ["Greece"]
+            extracted_locations = ["Greece"]
+        
+        # Set the project type
+        result['project_type'] = project_type
         
         # Check for office-related keywords
-        content_to_check = f"{result['title']} {result['snippet']} {result.get('full_content', '')}"
-        for keyword in office_keywords:
+        keyword_count = 0
+        for keyword in OFFICE_KEYWORDS:
             if keyword.lower() in content_to_check.lower():
-                score += 10
+                keyword_count += 1
+                if keyword_count <= 5:  # Cap the points from keywords
+                    score += 5
         
-        # Analyze content with NLP to extract relevant information
-        try:
-            # Tokenize and analyze the text - handle both English and Greek
-            # Try to detect if content is primarily Greek
-            is_greek = False
-            greek_chars = set('αβγδεζηθικλμνξοπρστυφχψωάέήίόύώϊϋΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩΆΈΉΊΌΎΏΪΫ')
-            sample_text = content_to_check[:1000].lower()  # Take a sample for analysis
-            greek_char_count = sum(1 for c in sample_text if c in greek_chars)
-            
-            if greek_char_count > len(sample_text) * 0.3:  # If more than 30% Greek characters
-                is_greek = True
-                
-            # Tokenize text
-            tokens = word_tokenize(content_to_check.lower())
-            filtered_tokens = [w for w in tokens if w not in stop_words]
-            
-            # Add additional score for Greek content when searching specifically for Greek content
-            if is_greek and any(q for q in result.get('query', '').lower() if 'ελλάδα' in q.lower() or 'γραφεία' in q.lower()):
-                score += 5
-            
-            # Count occurrences of office-related terms
-            office_term_count = sum(1 for token in filtered_tokens if any(keyword.lower() in token for keyword in office_keywords))
-            score += min(office_term_count * 2, 20)  # Cap at 20 points
-            
-            # Extract potential location information (in both English and Greek)
-            # English location pattern
-            eng_location_pattern = r'\b(?:in|at|near)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?),?\s+(?:Greece|Hellas)\b'
-            eng_location_matches = re.findall(eng_location_pattern, result['full_content'] if 'full_content' in result else result['snippet'])
-            
-            # Greek location pattern
-            greek_location_pattern = r'\b(?:στ(?:ην|ον|ο|α)|κοντά στ(?:ην|ον|ο|α))\s+([Α-ΩΆΈΉΊΌΎΏΪΫ][α-ωάέήίόύώϊϋ]+(?:\s+[Α-ΩΆΈΉΊΌΎΏΪΫ][α-ωάέήίόύώϊϋ]+)?),?\s+(?:Ελλάδα|Ελλάδας)\b'
-            greek_location_matches = re.findall(greek_location_pattern, result['full_content'] if 'full_content' in result else result['snippet'])
-            
-            # Combined matches
-            location_matches = eng_location_matches + greek_location_matches
-            location = location_matches[0] if location_matches else "Greece"
-            
-            # Extract potential size information (in both English and Greek)
-            size_pattern = r'\b(\d[\d,.]*)\s*(?:sq\.?m|square meters|m²|sqm|τ\.?μ\.?|τετραγωνικά μέτρα|τετραγωνικών μέτρων)\b'
-            size_matches = re.findall(size_pattern, result['full_content'] if 'full_content' in result else result['snippet'])
-            
-            if size_matches:
-                score += 10
-            
-        except Exception as e:
-            logging.warning(f"Error during NLP processing: {e}")
+        # Use our simple tokenizer instead of word_tokenize
+        tokens = simple_tokenize(content_to_check.lower())
+        filtered_tokens = [w for w in tokens if w not in stop_words]
+        
+        # Add additional score for language-specific scoring
+        if content_lang == "el" and 'el' in result.get('query_language', ''):
+            score += 5
+        
+        # Count occurrences of office-related terms
+        office_term_count = sum(1 for token in filtered_tokens if any(keyword.lower() in token for keyword in OFFICE_KEYWORDS))
+        score += min(office_term_count, 20)  # Cap at 20 points
+        
+        # Extract potential size information (in both English and Greek)
+        size_pattern = r'\b(\d[\d,.]*)\s*(?:sq\.?m|square meters|m²|sqm|τ\.?μ\.?|τετραγωνικά μέτρα|τετραγωνικών μέτρων)\b'
+        size_matches = re.findall(size_pattern, content_to_check)
+        
+        if size_matches:
+            score += 10
+            result['estimated_size'] = f"{size_matches[0]} sq.m"
+        
+        # Extract potential date information
+        date_pattern = r'\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b'
+        date_matches = re.findall(date_pattern, content_to_check)
+        
+        if date_matches:
+            try:
+                day, month, year = date_matches[0]
+                if len(year) == 2:
+                    year = f"20{year}"
+                result['date_reported'] = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+            except:
+                pass
         
         # If we have a reasonable relevance score, add it to our results
         if score >= 30:
             result['relevance_score'] = score
-            result['extracted_company'] = company_found if company_found else "Unknown"
-            result['extracted_location'] = location if 'location' in locals() else "Unknown"
+            result['extracted_company'] = extracted_companies[0] if extracted_companies else "Unknown"
+            result['extracted_location'] = extracted_locations[0] if extracted_locations else "Greece"
             relevant_results.append(result)
+    
+    conn.commit()
+    conn.close()
+    
+    # Sort by relevance score
+    relevant_results.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
     
     return relevant_results
 
@@ -590,7 +773,11 @@ def save_to_database(projects):
     
     new_projects_count = 0
     
-    for project in projects:
+    if projects:
+        print(f"Saving {len(projects)} relevant projects to database...")
+    
+    # Process projects with progress bar if there are any
+    for project in tqdm(projects, desc="Saving to database", unit="project") if projects else []:
         # Check if URL already exists
         cursor.execute('SELECT id FROM projects WHERE source_url = ?', (project['link'],))
         existing_url = cursor.fetchone()
@@ -668,6 +855,7 @@ def save_to_database(projects):
     
     logging.info(f"Saved {new_projects_count} new projects to database")
     return new_projects_count
+
 
 # Step 5: Send email notifications with improved formatting
 def send_email_notification(receiver_email):
@@ -796,7 +984,6 @@ def send_email_notification(receiver_email):
     conn.close()
     return success
 
-# Main function
 # Add analytics and reporting function
 def generate_analytics_report():
     """Generate an analytics report of project tracking trends"""
@@ -883,9 +1070,6 @@ def perform_maintenance():
     cursor.execute("DELETE FROM search_log WHERE date_searched < ?", (thirty_days_ago,))
     deleted_logs = cursor.rowcount
     
-    # Optimize database
-    cursor.execute("VACUUM")
-    
     # Update company relevance scores based on mention frequency
     cursor.execute("""
         UPDATE companies
@@ -897,70 +1081,15 @@ def perform_maintenance():
             END
     """)
     
+    # Must commit changes before running VACUUM
     conn.commit()
+    
+    # Now run VACUUM as a separate operation outside any transaction
+    conn.execute("VACUUM")
+    
     conn.close()
     
     logging.info(f"Maintenance complete: removed {deleted_logs} old search logs, optimized database")
-
-# Main function
-def main():
-    try:
-        logging.info("Starting office project search...")
-        
-        # Create database if it doesn't exist
-        create_database()
-        
-        # Get configuration from environment variables
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        cse_id = os.environ.get("GOOGLE_CSE_ID")
-        receiver_email = os.environ.get("RECEIVER_EMAIL", "panos.bompolas@inmind.com.gr")
-        
-        # Install required NLTK packages if needed
-        try:
-            nltk.download('punkt')
-            nltk.download('stopwords')
-        except:
-            logging.warning("Could not download NLTK resources. Will proceed with basic functionality.")
-        
-        if not all([api_key, cse_id]):
-            logging.error("API credentials not found in environment variables")
-            return
-        
-        # Perform database maintenance once a week (on Sundays)
-        if datetime.now().weekday() == 6:  # Sunday
-            perform_maintenance()
-        
-        # Search for office projects
-        results = search_web(api_key, cse_id)
-        logging.info(f"Found {len(results)} initial results")
-        
-        if results:
-            # Evaluate relevance and extract entities
-            relevant_results = evaluate_relevance(results)
-            logging.info(f"Filtered to {len(relevant_results)} relevant results")
-            
-            # Save to database
-            new_projects_count = save_to_database(relevant_results)
-            
-            # Send email if there are new projects
-            if new_projects_count > 0:
-                send_email_notification(receiver_email)
-            else:
-                logging.info("No new projects to notify about")
-        else:
-            logging.info("No results found in today's search")
-        
-        # Generate and log analytics once a week
-        if datetime.now().weekday() == 0:  # Monday
-            analytics = generate_analytics_report()
-            logging.info(f"Weekly Analytics: {json.dumps(analytics['summary'])}")
-            
-            # Send analytics email if configured
-            if os.environ.get("SEND_ANALYTICS", "false").lower() == "true":
-                send_analytics_email(receiver_email, analytics)
-    
-    except Exception as e:
-        logging.error(f"Error in main function: {e}")
 
 # Function to send analytics email
 def send_analytics_email(receiver_email, analytics):
@@ -1101,6 +1230,122 @@ def send_analytics_email(receiver_email, analytics):
     except Exception as e:
         logging.error(f"Failed to send analytics email: {e}")
         return False
+
+# Main function
+# Updated main function with improved error handling and NLTK handling
+def main():
+    try:
+        print("=" * 60)
+        print("OFFICE PROJECT TRACKER".center(60))
+        print("=" * 60)
+        
+        logging.info("Starting Office Project Tracker...")
+        print("Starting Office Project Tracker...\n")
+        
+        # Create database if it doesn't exist
+        create_database()
+        print("✅ Database initialized")
+        
+        # Get configuration from environment variables
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        cse_id = os.environ.get("GOOGLE_CSE_ID")
+        receiver_email = os.environ.get("RECEIVER_EMAIL", "panos.bompolas@inmind.com.gr")
+        
+        # Check API credentials before proceeding
+        if not all([api_key, cse_id]):
+            logging.error("API credentials not found in environment variables")
+            print("\n❌ ERROR: API credentials not found in environment variables")
+            print("Please set GOOGLE_API_KEY and GOOGLE_CSE_ID in your .env file")
+            return
+        
+        # Perform database maintenance once a week (on Sundays)
+        if datetime.now().weekday() == 6:  # Sunday
+            print("\nPerforming weekly database maintenance...")
+            perform_maintenance()
+            print("✅ Database maintenance completed")
+        
+        # Search for office projects
+        print("\n📊 STEP 1: Searching the web for office projects\n")
+        results = search_web(api_key, cse_id)
+        logging.info(f"Found {len(results)} initial results")
+        print(f"\n✅ Found {len(results)} initial results")
+        
+        if results:
+            # Evaluate relevance and extract entities
+            print("\n📊 STEP 2: Analyzing relevance of search results\n")
+            relevant_results = evaluate_relevance(results)
+            logging.info(f"Filtered to {len(relevant_results)} relevant results")
+            print(f"\n✅ Filtered to {len(relevant_results)} relevant results")
+            
+            # Save to database
+            print("\n📊 STEP 3: Saving relevant results to database\n")
+            new_projects_count = save_to_database(relevant_results)
+            
+            # Send email if there are new projects
+            if new_projects_count > 0:
+                print(f"\n📊 STEP 4: Sending email notification with {new_projects_count} new projects\n")
+                if send_email_notification(receiver_email):
+                    print(f"\n✅ Email sent successfully with {new_projects_count} new projects!")
+                else:
+                    print("\n❌ Failed to send email notification")
+            else:
+                print("\n📝 No new projects to notify about")
+                logging.info("No new projects to notify about")
+        else:
+            print("\n📝 No results found in today's search")
+            logging.info("No results found in today's search")
+        
+        # Generate and log analytics once a week
+        if datetime.now().weekday() == 0:  # Monday
+            print("\n📊 Generating weekly analytics report...")
+            try:
+                analytics = generate_analytics_report()
+                logging.info(f"Weekly Analytics: {json.dumps(analytics['summary'])}")
+                
+                # Send analytics email if configured
+                if os.environ.get("SEND_ANALYTICS", "false").lower() == "true":
+                    print("Sending analytics email...")
+                    if send_analytics_email(receiver_email, analytics):
+                        print("✅ Analytics email sent!")
+                    else:
+                        print("❌ Failed to send analytics email")
+            except Exception as analytics_error:
+                print(f"❌ Error generating analytics: {analytics_error}")
+                logging.error(f"Error generating analytics: {analytics_error}")
+        
+        print("\n" + "=" * 60)
+        print("✅ OFFICE PROJECT TRACKER COMPLETED SUCCESSFULLY".center(60))
+        print("=" * 60)
+        
+        # Display a summary of what was done
+        print("\nSUMMARY:")
+        print(f"• Searched with multiple queries in English and Greek")
+        if 'results' in locals() and results:
+            print(f"• Found {len(results)} initial results")
+            if 'relevant_results' in locals() and relevant_results:
+                print(f"• Identified {len(relevant_results)} relevant office projects")
+                if 'new_projects_count' in locals() and new_projects_count > 0:
+                    print(f"• Added {new_projects_count} new projects to the database")
+                    print(f"• Sent notification to {receiver_email}")
+                else:
+                    print("• No new projects added (already in database)")
+            else:
+                print("• No relevant office projects found")
+        else:
+            print("• No search results found")
+    
+    except Exception as e:
+        logging.error(f"Error in main function: {e}")
+        print(f"\n❌ ERROR: {e}")
+
+if __name__ == "__main__":
+    main()
+    
+    # If running from command line, wait for key press before exiting
+    import sys
+    if sys.stdin.isatty():  # Only if running in terminal, not as service
+        print("\nPress Enter to exit...")
+        input()
 
 if __name__ == "__main__":
     main()
