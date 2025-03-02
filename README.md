@@ -1,4 +1,18 @@
-# Office Project Tracker
+# OfficeInsights: Automated Real Estate Intelligence
+
+An intelligent system that automatically scans the web for new office development projects, relocations, and commercial real estate transactions. Provides real-time email notifications about new office spaces, corporate moves, and real estate opportunities across Greece in both English and Greek.
+
+## Key Features
+- Automated daily web scanning for office-related news
+- Multilingual support (English & Greek)
+- Entity extraction for companies and locations
+- Customizable email notifications
+- Analytics and reporting dashboard
+- No-code setup for non-technical users
+
+Perfect for real estate professionals, commercial property investors, and business intelligence analysts tracking office market trends.
+
+
 # User Guide
 
 ## Table of Contents
